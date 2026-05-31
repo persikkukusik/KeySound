@@ -64,9 +64,16 @@ DEFAULT_CONFIG = {
     "blacklist":           [],
     "overrides":           {},
     # mouse
-    "mouse_btn_enabled":   True,
-    "mouse_move_sound":    "",
-    "mouse_move_multiplier": 50,   # 1-200 — scales delta → volume
+    "mouse_btn_enabled":      True,
+    "mouse_move_sound":       "",
+    "mouse_move_multiplier":  0.5,
+    "mouse_move_vol_smooth":  0.15,   # 0.0 = instant, 1.0 = very slow fade
+    # pitch
+    "pitch_multiplier":       1.0,    # overall pitch scale (0.5 – 2.0)
+    "pitch_random_offset":    0.0,    # ± random offset applied each play
+    # pan
+    "pan_strength":           0.0,    # 0 = off, 1 = full pan from mouse X position
+    "pan_mouse_only":         False,  # True = pan only mouse buttons + move sound, not keyboard keys
 }
 
 
@@ -103,13 +110,47 @@ def key_to_sound(key_code: int, sounds: list[Path]) -> Path | None:
     return sounds[key_code % len(sounds)]
 
 
-def play(path: Path | None, volume: float) -> None:
+def play(path: Path | None, volume: float,
+         pitch: float = 1.0, pan: float = 0.0) -> None:
+    """Play a sound file at the given volume, pitch and pan.
+
+    pan: -1.0 = full left, 0.0 = centre, +1.0 = full right.
+    Implemented by setting per-channel left/right volumes on the mixer channel.
+    Pitch != 1.0 is achieved by resampling the raw PCM array so pygame plays
+    it at the mixer's fixed sample-rate, producing a higher/lower perceived
+    pitch without changing playback duration noticeably for short clips.
+    Falls back to plain playback when numpy is unavailable or pitch is 1.0.
+    """
     if path is None or volume <= 0:
         return
     try:
         snd = pygame.mixer.Sound(str(path))
-        snd.set_volume(min(volume, 1.0))
-        snd.play()
+        if abs(pitch - 1.0) > 1e-4:
+            try:
+                import numpy as np
+                arr = pygame.sndarray.array(snd)          # shape: (samples, channels) or (samples,)
+                n_orig = arr.shape[0]
+                n_new  = max(1, int(round(n_orig / pitch)))
+                indices = np.linspace(0, n_orig - 1, n_new)
+                left    = np.floor(indices).astype(int)
+                right   = np.clip(left + 1, 0, n_orig - 1)
+                frac    = (indices - left)[:, np.newaxis] if arr.ndim == 2 else (indices - left)
+                resampled = (arr[left] * (1 - frac) + arr[right] * frac).astype(arr.dtype)
+                snd = pygame.sndarray.make_sound(resampled)
+            except Exception as e:
+                print(f"  ⚠ pitch resample error: {e}")
+        vol = min(volume, 1.0)
+        if abs(pan) > 1e-4:
+            # Equal-power pan: centre energy is preserved
+            pan_c = max(-1.0, min(1.0, pan))
+            left_vol  = vol * (1.0 - max(0.0,  pan_c))
+            right_vol = vol * (1.0 + min(0.0, pan_c))
+            ch = snd.play()
+            if ch is not None:
+                ch.set_volume(left_vol, right_vol)
+        else:
+            snd.set_volume(vol)
+            snd.play()
     except Exception as e:
         print(f"  ⚠ play error: {e}")
 
@@ -131,9 +172,17 @@ class KeyListener(QObject):
         self.blacklist: set[int] = set()
         self.overrides: dict[int, dict] = {}
         # mouse
-        self.mouse_btn_enabled   = True
-        self.mouse_move_sound:   Path | None = None
-        self.mouse_move_mult     = 0.5   # normalised multiplier
+        self.mouse_btn_enabled     = True
+        self.mouse_move_sound: Path | None = None
+        self.mouse_move_mult       = 0.5   # normalised multiplier
+        self.mouse_move_vol_smooth = 0.15  # interpolation factor (0=instant, 1=never)
+        # pitch
+        self.pitch_multiplier      = 1.0   # overall pitch scale
+        self.pitch_random_offset   = 0.0   # per-play ± random offset
+        # pan
+        self.pan_strength          = 0.0   # 0=off, 1=full
+        self.pan_mouse_only        = False  # if True, keyboard keys play at centre
+        self.mouse_x_norm          = 0.0   # live −1.0…+1.0 (updated by mouse handler)
 
     def start(self, **kw):
         for k, v in kw.items():
@@ -150,6 +199,21 @@ class KeyListener(QObject):
     def update(self, **kw):
         for k, v in kw.items():
             setattr(self, k, v)
+
+    def _pitch(self) -> float:
+        """Return a pitch value = multiplier ± random offset."""
+        import random
+        offset = 0.0
+        if self.pitch_random_offset > 0:
+            offset = random.uniform(-self.pitch_random_offset,
+                                     self.pitch_random_offset)
+        return max(0.1, self.pitch_multiplier + offset)
+
+    def _pan(self) -> float:
+        """Return the current pan value scaled by pan_strength.
+        mouse_x_norm is −1.0 (left edge) … 0.0 (centre) … +1.0 (right edge).
+        """
+        return max(-1.0, min(1.0, self.mouse_x_norm * self.pan_strength))
 
     # ── device discovery ──────────────────────────────────────────────────────
     def _find_keyboards(self) -> list[InputDevice]:
@@ -217,21 +281,23 @@ class KeyListener(QObject):
                 continue
             code, state = event.code, event.value
 
+            kb_pan = 0.0 if self.pan_mouse_only else self._pan()
+
             if state == 1 and code not in held:
                 held.add(code)
                 if self.enabled and code not in self.blacklist:
                     if code in self.overrides:
-                        play(self.overrides[code].get("press"), self.volume)
+                        play(self.overrides[code].get("press"), self.volume, self._pitch(), kb_pan)
                     else:
-                        play(key_to_sound(code, self.press_sounds), self.volume)
+                        play(key_to_sound(code, self.press_sounds), self.volume, self._pitch(), kb_pan)
 
             elif state == 0:
                 held.discard(code)
                 if self.enabled and code not in self.blacklist:
                     if code in self.overrides:
-                        play(self.overrides[code].get("release"), self.volume)
+                        play(self.overrides[code].get("release"), self.volume, self._pitch(), kb_pan)
                     else:
-                        play(key_to_sound(code, self.release_sounds), self.volume)
+                        play(key_to_sound(code, self.release_sounds), self.volume, self._pitch(), kb_pan)
 
     # ── mouse handler ─────────────────────────────────────────────────────────
     async def _handle_mouse(self, dev: InputDevice):
@@ -241,24 +307,52 @@ class KeyListener(QObject):
         move_snd_path: Path | None = None
         move_snd_obj:  pygame.mixer.Sound | None = None
 
+        # Absolute mouse X position (pixels), clamped to screen width.
+        # Initialise to screen centre so pan starts neutral.
+        try:
+            from PyQt6.QtWidgets import QApplication
+            screen_w = QApplication.primaryScreen().size().width()
+        except Exception:
+            screen_w = 1920
+        abs_x: float = screen_w / 2.0
+
         # Rolling window: store (timestamp, distance) samples from the last
         # WINDOW_S seconds. Volume = total distance in window * mult / SCALE.
         WINDOW_S   = 0.05  # 50 ms window
-        SCALE      = 200.0 # px/s that maps to vol=1.0 at mult=1.0
+        SCALE      = 200.0 # px/s → vol=1.0 at mult=1.0 (mult can exceed 1.0)
         samples: list[tuple[float, float]] = []  # [(t, dist), ...]
         last_move_t: float = 0.0  # time of last non-zero movement packet
 
+        # Track the logical (unpanned) volume as a plain float so we never
+        # read it back from the channel — get_volume() only returns the left
+        # channel after set_volume(l, r), which breaks the lerp when panned.
+        move_vol: list[float] = [0.0]   # mutable cell so watchdog can share it
+
+        def _apply_move_vol(vol: float) -> None:
+            """Write vol to the channel, splitting for pan if needed."""
+            move_vol[0] = vol
+            if move_channel is None:
+                return
+            pan_v = self._pan()
+            if abs(pan_v) > 1e-4:
+                move_channel.set_volume(
+                    vol * (1.0 - max(0.0,  pan_v)),
+                    vol * (1.0 + min(0.0, pan_v)),
+                )
+            else:
+                move_channel.set_volume(vol)
+
         async def _silence_watchdog():
             # Runs concurrently. Every WINDOW_S seconds it checks whether the
-            # mouse has been idle for a full window; if so it zeroes the channel.
-            # This is needed because a still mouse sends NO events at all, so
-            # the event loop never gets a chance to clear stale samples.
+            # mouse has been idle for a full window; if so it lerps toward zero.
             while self._running:
                 await asyncio.sleep(WINDOW_S)
                 if move_channel is not None:
                     now = _time.monotonic()
                     if now - last_move_t >= WINDOW_S:
-                        move_channel.set_volume(0.0)
+                        smooth  = max(0.0, min(0.99, self.mouse_move_vol_smooth))
+                        faded   = move_vol[0] * smooth   # lerp toward 0
+                        _apply_move_vol(faded if faded > 0.001 else 0.0)
 
         asyncio.ensure_future(_silence_watchdog())
 
@@ -272,25 +366,29 @@ class KeyListener(QObject):
                 if state == 1 and self.enabled and self.mouse_btn_enabled:
                     if code not in self.blacklist:
                         if code in self.overrides:
-                            play(self.overrides[code].get("press"), self.volume)
+                            play(self.overrides[code].get("press"), self.volume, self._pitch(), self._pan())
                         else:
-                            play(key_to_sound(code, self.press_sounds), self.volume)
+                            play(key_to_sound(code, self.press_sounds), self.volume, self._pitch(), self._pan())
                 elif state == 0 and self.enabled and self.mouse_btn_enabled:
                     if code not in self.blacklist:
                         if code in self.overrides:
-                            play(self.overrides[code].get("release"), self.volume)
+                            play(self.overrides[code].get("release"), self.volume, self._pitch(), self._pan())
                         else:
-                            play(key_to_sound(code, self.release_sounds), self.volume)
+                            play(key_to_sound(code, self.release_sounds), self.volume, self._pitch(), self._pan())
 
             # ── movement: accumulate into dx/dy ───────────────────────────────
             elif event.type == ecodes.EV_REL:
                 if event.code == ecodes.REL_X:
-                    dx += event.value
+                    dx    += event.value
+                    abs_x  = max(0.0, min(screen_w, abs_x + event.value))
                 elif event.code == ecodes.REL_Y:
                     dy += event.value
 
             # ── sync: one report packet is complete ───────────────────────────
             elif event.type == ecodes.EV_SYN:
+                # Update normalised mouse X: 0=left → -1.0, centre → 0.0, right → +1.0
+                if screen_w > 0:
+                    self.mouse_x_norm = (abs_x / screen_w) * 2.0 - 1.0
                 # Reload sound only when the file path changes
                 if self.mouse_move_sound != move_snd_path:
                     move_snd_path = self.mouse_move_sound
@@ -300,6 +398,7 @@ class KeyListener(QObject):
                     move_snd_obj = None
                     samples.clear()
                     last_move_t = 0.0
+                    move_vol[0] = 0.0
                     if move_snd_path:
                         try:
                             move_snd_obj = pygame.mixer.Sound(str(move_snd_path))
@@ -323,11 +422,14 @@ class KeyListener(QObject):
                     if self.enabled and self.mouse_move_mult > 0 and samples:
                         total_dist = sum(d for _, d in samples)
                         speed = total_dist / WINDOW_S      # pixels / sec
-                        vol   = min(speed * self.mouse_move_mult / SCALE, 1.0)
+                        target_vol = speed * self.mouse_move_mult / SCALE
                     else:
-                        vol = 0.0
+                        target_vol = 0.0
 
-                    move_channel.set_volume(vol)
+                    # Lerp the logical volume, then write to channel with pan
+                    smooth  = max(0.0, min(0.99, self.mouse_move_vol_smooth))
+                    new_vol = max(0.0, min(1.0, move_vol[0] + (1.0 - smooth) * (target_vol - move_vol[0])))
+                    _apply_move_vol(new_vol)
 
                 dx = dy = 0
 
@@ -335,6 +437,10 @@ class KeyListener(QObject):
 
 # ── Tray icon ─────────────────────────────────────────────────────────────────
 def make_tray_icon(active: bool) -> QIcon:
+    name = "Icon.png" if active else "Icon-gray.png"
+    icon_path = SCRIPT_DIR / name
+    if icon_path.is_file():
+        return QIcon(str(icon_path))
     px = QPixmap(64, 64)
     px.fill(Qt.GlobalColor.transparent)
     p = QPainter(px)
@@ -583,6 +689,9 @@ class OverridesPanel(QGroupBox):
     def _add_row(self, key_name="", press_path="", release_path=""):
         row = OverrideRow(key_name, press_path, release_path)
         row.removed.connect(self._remove_row)
+        row.key_combo.currentTextChanged.connect(self.changed)
+        row.press_edit.textChanged.connect(self.changed)
+        row.release_edit.textChanged.connect(self.changed)
         self._rows.append(row)
         self._rows_layout.insertWidget(self._rows_layout.count() - 1, row)
         self.changed.emit()
@@ -610,6 +719,116 @@ class OverridesPanel(QGroupBox):
             self._add_row(key_name, paths.get("press", ""), paths.get("release", ""))
 
 
+# ── Keyboard settings panel ───────────────────────────────────────────────────
+class KeyboardPanel(QGroupBox):
+    changed = pyqtSignal()
+
+    def __init__(self):
+        super().__init__("Keyboard")
+        layout = QVBoxLayout(self)
+        layout.setSpacing(6)
+
+        # Pitch multiplier (0.5 – 2.0)
+        pitch_row = QHBoxLayout()
+        pitch_row.addWidget(QLabel("Pitch multiplier:"))
+        self.pitch_mult_slider = QSlider(Qt.Orientation.Horizontal)
+        self.pitch_mult_slider.setRange(50, 200)   # maps to 0.50×–2.00×
+        self.pitch_mult_slider.setValue(100)        # default 1.00×
+        self.pitch_mult_slider.setFixedWidth(160)
+        self.pitch_mult_slider.valueChanged.connect(self._on_pitch_mult)
+        pitch_row.addWidget(self.pitch_mult_slider)
+        self.pitch_mult_label = QLabel()
+        self.pitch_mult_label.setFixedWidth(50)
+        pitch_row.addWidget(self.pitch_mult_label)
+        pitch_mult_hint = QLabel("  (overall pitch of all key/mouse sounds)")
+        pitch_mult_hint.setStyleSheet("color: #888; font-size: 11px;")
+        pitch_row.addWidget(pitch_mult_hint)
+        pitch_row.addStretch()
+        layout.addLayout(pitch_row)
+        self._on_pitch_mult(self.pitch_mult_slider.value())
+
+        # Pitch random offset (0 – 0.50)
+        offset_row = QHBoxLayout()
+        offset_row.addWidget(QLabel("Pitch offset ±:"))
+        self.pitch_offset_slider = QSlider(Qt.Orientation.Horizontal)
+        self.pitch_offset_slider.setRange(0, 50)   # maps to 0.00–0.50
+        self.pitch_offset_slider.setValue(0)
+        self.pitch_offset_slider.setFixedWidth(160)
+        self.pitch_offset_slider.valueChanged.connect(self._on_pitch_offset)
+        offset_row.addWidget(self.pitch_offset_slider)
+        self.pitch_offset_label = QLabel()
+        self.pitch_offset_label.setFixedWidth(50)
+        offset_row.addWidget(self.pitch_offset_label)
+        offset_hint = QLabel("  (random pitch variation per keypress)")
+        offset_hint.setStyleSheet("color: #888; font-size: 11px;")
+        offset_row.addWidget(offset_hint)
+        offset_row.addStretch()
+        layout.addLayout(offset_row)
+        self._on_pitch_offset(self.pitch_offset_slider.value())
+
+        # Pan strength (0 = off, 100 = full)
+        pan_row = QHBoxLayout()
+        pan_row.addWidget(QLabel("Pan strength:"))
+        self.pan_slider = QSlider(Qt.Orientation.Horizontal)
+        self.pan_slider.setRange(0, 100)
+        self.pan_slider.setValue(0)
+        self.pan_slider.setFixedWidth(160)
+        self.pan_slider.valueChanged.connect(self._on_pan)
+        pan_row.addWidget(self.pan_slider)
+        self.pan_label = QLabel()
+        self.pan_label.setFixedWidth(40)
+        pan_row.addWidget(self.pan_label)
+        pan_hint = QLabel("  (0 = off  →  sounds pan left/right with mouse X position)")
+        pan_hint.setStyleSheet("color: #888; font-size: 11px;")
+        pan_row.addWidget(pan_hint)
+        pan_row.addStretch()
+        layout.addLayout(pan_row)
+        self._on_pan(self.pan_slider.value())
+
+        # Pan scope checkbox
+        self.pan_mouse_only_cb = QCheckBox(
+            "Mouse only  (pan applies to mouse buttons + move sound; keyboard keys always centred)"
+        )
+        self.pan_mouse_only_cb.setChecked(False)
+        self.pan_mouse_only_cb.stateChanged.connect(self.changed)
+        layout.addWidget(self.pan_mouse_only_cb)
+
+    def _on_pitch_mult(self, val):
+        self.pitch_mult_label.setText(f"{val / 100.0:.2f}\u00d7")
+        self.changed.emit()
+
+    def _on_pitch_offset(self, val):
+        self.pitch_offset_label.setText(f"\u00b1{val / 100.0:.2f}")
+        self.changed.emit()
+
+    def _on_pan(self, val):
+        self.pan_label.setText("off" if val == 0 else f"{val}%")
+        self.changed.emit()
+
+    def get_values(self) -> dict:
+        return {
+            "pitch_multiplier":    self.pitch_mult_slider.value() / 100.0,
+            "pitch_random_offset": self.pitch_offset_slider.value() / 100.0,
+            "pan_strength":        self.pan_slider.value() / 100.0,
+            "pan_mouse_only":      self.pan_mouse_only_cb.isChecked(),
+        }
+
+    def set_values(self, cfg: dict):
+        pitch_mult_val = int(round(cfg.get("pitch_multiplier", 1.0) * 100))
+        self.pitch_mult_slider.setValue(max(50, min(200, pitch_mult_val)))
+        self._on_pitch_mult(self.pitch_mult_slider.value())
+
+        pitch_offset_val = int(round(cfg.get("pitch_random_offset", 0.0) * 100))
+        self.pitch_offset_slider.setValue(max(0, min(50, pitch_offset_val)))
+        self._on_pitch_offset(self.pitch_offset_slider.value())
+
+        pan_val = int(round(cfg.get("pan_strength", 0.0) * 100))
+        self.pan_slider.setValue(max(0, min(100, pan_val)))
+        self._on_pan(self.pan_slider.value())
+
+        self.pan_mouse_only_cb.setChecked(cfg.get("pan_mouse_only", False))
+
+
 # ── Mouse settings panel ──────────────────────────────────────────────────────
 class MousePanel(QGroupBox):
     changed = pyqtSignal()
@@ -627,43 +846,91 @@ class MousePanel(QGroupBox):
 
         # Move sound file
         self.move_row = FileRow("Move sound:", "Sound file played on mouse movement… (optional)")
+        self.move_row.edit.textChanged.connect(self.changed)
         layout.addWidget(self.move_row)
 
-        # Delta multiplier
+        # Delta multiplier (geometric: slider 0-100 → multiplier 0.001–2.0)
         mult_row = QHBoxLayout()
         mult_row.addWidget(QLabel("Delta multiplier:"))
         self.mult_slider = QSlider(Qt.Orientation.Horizontal)
-        self.mult_slider.setRange(0, 200)
-        self.mult_slider.setValue(50)
+        self.mult_slider.setRange(0, 100)
+        self.mult_slider.setValue(self._mult_to_slider(0.5))
         self.mult_slider.setFixedWidth(160)
         self.mult_slider.valueChanged.connect(self._on_mult)
         mult_row.addWidget(self.mult_slider)
-        self.mult_label = QLabel("0.50×")
-        self.mult_label.setFixedWidth(44)
+        self.mult_label = QLabel()
+        self.mult_label.setFixedWidth(70)
         mult_row.addWidget(self.mult_label)
         hint = QLabel("  (higher = louder at same speed)")
         hint.setStyleSheet("color: #888; font-size: 11px;")
         mult_row.addWidget(hint)
         mult_row.addStretch()
         layout.addLayout(mult_row)
+        self._on_mult(self.mult_slider.value())
+
+        # Volume smoothing slider (0 = instant, 99 = very slow)
+        smooth_row = QHBoxLayout()
+        smooth_row.addWidget(QLabel("Vol smoothing:"))
+        self.smooth_slider = QSlider(Qt.Orientation.Horizontal)
+        self.smooth_slider.setRange(0, 99)
+        self.smooth_slider.setValue(15)   # default 0.15
+        self.smooth_slider.setFixedWidth(160)
+        self.smooth_slider.valueChanged.connect(self._on_smooth)
+        smooth_row.addWidget(self.smooth_slider)
+        self.smooth_label = QLabel()
+        self.smooth_label.setFixedWidth(70)
+        smooth_row.addWidget(self.smooth_label)
+        smooth_hint = QLabel("  (how quickly move-sound volume reacts)")
+        smooth_hint.setStyleSheet("color: #888; font-size: 11px;")
+        smooth_row.addWidget(smooth_hint)
+        smooth_row.addStretch()
+        layout.addLayout(smooth_row)
+        self._on_smooth(self.smooth_slider.value())
+
+    @staticmethod
+    def _slider_to_mult(val: int) -> float:
+        if val <= 0:
+            return 0.0
+        return 0.001 * (2000.0 ** (val / 100.0))
+
+    @staticmethod
+    def _mult_to_slider(mult: float) -> int:
+        if mult <= 0.001:
+            return 0
+        return int(round(100.0 * math.log(mult / 0.001) / math.log(2000.0)))
 
     def _on_mult(self, val):
-        self.mult_label.setText("off" if val == 0 else f"{val/100:.2f}×")
+        mult = self._slider_to_mult(val)
+        self.mult_label.setText("off" if val == 0 else f"{mult:.3f}\u00d7")
+        self.changed.emit()
+
+    def _on_smooth(self, val):
+        self.smooth_label.setText(f"{val / 100.0:.2f}")
         self.changed.emit()
 
     def get_values(self) -> dict:
         return {
-            "mouse_btn_enabled":      self.btn_cb.isChecked(),
-            "mouse_move_sound":       self.move_row.path(),
-            "mouse_move_multiplier":  self.mult_slider.value(),
+            "mouse_btn_enabled":     self.btn_cb.isChecked(),
+            "mouse_move_sound":      self.move_row.path(),
+            "mouse_move_multiplier": self._slider_to_mult(self.mult_slider.value()),
+            "mouse_move_vol_smooth": self.smooth_slider.value() / 100.0,
         }
 
     def set_values(self, cfg: dict):
         self.btn_cb.setChecked(cfg.get("mouse_btn_enabled", True))
         self.move_row.set_path(cfg.get("mouse_move_sound", ""))
-        val = cfg.get("mouse_move_multiplier", 50)
+        raw = cfg.get("mouse_move_multiplier", 0.5)
+        if raw > 2.0:  # old config format: slider position 0-200
+            mult = raw / 100.0
+        else:
+            mult = raw
+        val = self._mult_to_slider(mult)
         self.mult_slider.setValue(val)
-        self.mult_label.setText("off" if val == 0 else f"{val/100:.2f}×")
+        self._on_mult(val)
+
+        smooth_val = int(round(cfg.get("mouse_move_vol_smooth", 0.15) * 100))
+        self.smooth_slider.setValue(max(0, min(99, smooth_val)))
+        self._on_smooth(self.smooth_slider.value())
 
 
 # ── Main window ───────────────────────────────────────────────────────────────
@@ -675,7 +942,9 @@ class MainWindow(QMainWindow):
         self._init_audio()
         self._build_ui()
         self._build_tray()
+        self._suppress_save = True
         self._populate_from_config()
+        self._suppress_save = False
         self._apply_config()
         self._start_listener()
 
@@ -746,6 +1015,13 @@ class MainWindow(QMainWindow):
 
         vbox.addWidget(_hline())
 
+        # Keyboard panel
+        self.keyboard_panel = KeyboardPanel()
+        self.keyboard_panel.changed.connect(self._apply_config)
+        vbox.addWidget(self.keyboard_panel)
+
+        vbox.addWidget(_hline())
+
         # Mouse panel
         self.mouse_panel = MousePanel()
         self.mouse_panel.changed.connect(self._apply_config)
@@ -801,12 +1077,6 @@ class MainWindow(QMainWindow):
         )
         self.tray.show()
 
-    def closeEvent(self, event):
-        event.ignore()
-        self.hide()
-        self.tray.showMessage("KeySound", "Still running in the tray.",
-                              QSystemTrayIcon.MessageIcon.Information, 2000)
-
     def _toggle_window(self):
         if self.isVisible():
             self.hide()
@@ -824,6 +1094,7 @@ class MainWindow(QMainWindow):
         self.vol_slider.setValue(self.cfg.get("volume", 100))
         self.blacklist_panel.set_keys(self.cfg.get("blacklist", []))
         self.overrides_panel.set_overrides(self.cfg.get("overrides", {}))
+        self.keyboard_panel.set_values(self.cfg)
         self.mouse_panel.set_values(self.cfg)
 
     def _start_listener(self):
@@ -853,28 +1124,39 @@ class MainWindow(QMainWindow):
 
         move_path = self.cfg.get("mouse_move_sound", "")
         move_sound = Path(move_path) if move_path and Path(move_path).is_file() else None
-        # normalise multiplier: slider 0-200 → 0.0-2.0
-        move_mult = self.cfg.get("mouse_move_multiplier", 50) / 100.0
+        raw = self.cfg.get("mouse_move_multiplier", 0.5)
+        if raw > 2.0:  # old config format: slider position 0-200
+            move_mult = raw / 100.0
+        else:
+            move_mult = raw
 
         return dict(
-            press_sounds       = press,
-            release_sounds     = release,
-            enabled            = self.cfg["enabled"],
-            volume             = volume,
-            blacklist          = blacklist,
-            overrides          = overrides,
-            mouse_btn_enabled  = self.cfg.get("mouse_btn_enabled", True),
-            mouse_move_sound   = move_sound,
-            mouse_move_mult    = move_mult,
+            press_sounds          = press,
+            release_sounds        = release,
+            enabled               = self.cfg["enabled"],
+            volume                = volume,
+            blacklist             = blacklist,
+            overrides             = overrides,
+            mouse_btn_enabled     = self.cfg.get("mouse_btn_enabled", True),
+            mouse_move_sound      = move_sound,
+            mouse_move_mult       = move_mult,
+            mouse_move_vol_smooth = self.cfg.get("mouse_move_vol_smooth", 0.15),
+            pitch_multiplier      = self.cfg.get("pitch_multiplier", 1.0),
+            pitch_random_offset   = self.cfg.get("pitch_random_offset", 0.0),
+            pan_strength          = self.cfg.get("pan_strength", 0.0),
+            pan_mouse_only        = self.cfg.get("pan_mouse_only", False),
         )
 
     def _apply_config(self):
+        if getattr(self, '_suppress_save', False):
+            return
         self.cfg["press_folder"]   = self.press_row.path()
         self.cfg["release_folder"] = self.release_row.path()
         self.cfg["enabled"]        = self.enabled_cb.isChecked()
         self.cfg["volume"]         = self.vol_slider.value()
         self.cfg["blacklist"]      = self.blacklist_panel.get_keys()
         self.cfg["overrides"]      = self.overrides_panel.get_overrides()
+        self.cfg.update(self.keyboard_panel.get_values())
         self.cfg.update(self.mouse_panel.get_values())
         save_config(self.cfg)
 
